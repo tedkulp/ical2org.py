@@ -1,11 +1,15 @@
+#!/usr/bin/env python3
+
 from __future__ import print_function
 from math import floor
 from datetime import datetime, timedelta
+from hashlib import md5
 import itertools
 from icalendar import Calendar
 from pytz import timezone, utc, all_timezones
 from tzlocal import get_localzone
 import click
+from pprint import pprint
 
 def org_datetime(dt, tz):
     '''Timezone aware datetime to YYYY-MM-DD DayofWeek HH:MM str in localtime.
@@ -16,6 +20,11 @@ def org_date(dt, tz):
     '''Timezone aware date to YYYY-MM-DD DayofWeek in localtime.
     '''
     return dt.astimezone(tz).strftime("<%Y-%m-%d %a>")
+
+def format_datetime(dt, tz):
+    '''Timezone aware datetime to YYYY-MM-DD HH:MM str in localtime.
+    '''
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M")
 
 def get_datetime(dt, tz):
     '''Convert date or datetime to local datetime.
@@ -47,6 +56,10 @@ def advance_just_before(start_dt, timeframe_start, delta_days):
         (timeframe_start.toordinal() - start_dt.toordinal() - 1) / delta_days)
     return (add_delta_dst(
         start_dt, timedelta(days=delta_days * int(delta_ord))), int(delta_ord))
+
+def generate_id(start_date, end_date, uid, timezone):
+    str_to_hash = u"{}{}{}".format(format_datetime(start_date, timezone), format_datetime(end_date, timezone), uid)
+    return md5(str_to_hash.encode()).hexdigest()
 
 def generate_events(comp, timeframe_start, timeframe_end, tz, emails):
     '''Get iterator with the proper delta (days, weeks, etc)'''
@@ -99,10 +112,15 @@ class SingleEvent():
         ev_start = get_datetime(comp['DTSTART'].dt, tz)
         # Events with the same begin/end time same do not include
         # "DTEND".
-        if "DTEND" not in comp:
-            ev_end = ev_start
-        else:
+        if "DTEND" in comp:
             ev_end = get_datetime(comp['DTEND'].dt, tz)
+            self.duration = ev_end - ev_start
+        else:
+            if "DURATION" in comp:
+                self.duration = comp['DURATION'].dt
+                ev_end = ev_start + self.duration
+            else:
+                ev_end = ev_start
         self.duration = ev_end - ev_start
         self.events = []
         if (ev_start < timeframe_end and ev_end > timeframe_start):
@@ -253,6 +271,7 @@ class Convertor():
         self.tz = timezone(tz) if tz else get_localzone()
         self.days = days
         self.include_location = include_location
+        self.hashes = []
 
     def __call__(self, fh, fh_w):
         try:
@@ -265,6 +284,7 @@ class Convertor():
         start = now - timedelta(days=self.days)
         end = now + timedelta(days=self.days)
         for comp in cal.walk():
+            # print(comp)
             summary = None
             if "SUMMARY" in comp:
                 summary = comp['SUMMARY'].to_ical().decode("utf-8")
@@ -285,10 +305,32 @@ class Convertor():
             try:
                 events = generate_events(comp, start, end, self.tz, self.emails)
                 for comp_start, comp_end, rec_event in events:
+                    uid = comp.get('UID', '**NOID**')
+                    org_uid = generate_id(comp_start, comp_end, uid, self.tz)
+
+                    # Prune duplicates
+                    if org_uid in self.hashes:
+                        continue
+                    self.hashes.append(org_uid)
+
                     fh_w.write(u"* {}".format(summary))
                     if rec_event and self.RECUR_TAG:
                         fh_w.write(u" {}\n".format(self.RECUR_TAG))
                     fh_w.write(u"\n")
+                    fh_w.write(u":ICALCONTENTS:\n")
+                    fh_w.write(u":ORGUID: {}\n".format(org_uid))
+                    fh_w.write(u":ORIGINAL-UID: {}\n".format(uid))
+                    fh_w.write(u":DTSTART: {}\n".format(format_datetime(comp_start, self.tz)))
+                    fh_w.write(u":DTEND: {}\n".format(format_datetime(comp_end, self.tz)))
+                    fh_w.write(u":DTSTAMP: {}\n".format(format_datetime(comp['DTSTAMP'].dt, self.tz)))
+                    if 'ATTENDEE' in comp:
+                        for attendee in comp['ATTENDEE']:
+                            fh_w.write(u":ATTENDEE: {}\n".format(attendee))
+                    if 'ORGANIZER' in comp:
+                        fh_w.write(u":ORGANIZER: {}\n".format(comp['ORGANIZER']))
+                    if 'RRULE' in comp:
+                        fh_w.write(u":RRULE: {}\n".format(comp['RRULE']))
+                    fh_w.write(u":END:\n")
                     if isinstance(comp["DTSTART"].dt, datetime):
                         fh_w.write(u"  {}--{}\n".format(
                             org_datetime(comp_start, self.tz),
@@ -298,6 +340,7 @@ class Convertor():
                             org_date(comp_start, timezone('UTC')),
                             org_date(comp_end - timedelta(days=1), timezone('UTC'))))
                     if description:
+                        fh_w.write(u"** Description\n\n")
                         fh_w.write(u"{}\n".format(description))
                     fh_w.write(u"\n")
             except Exception as e:
