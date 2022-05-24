@@ -10,6 +10,7 @@ from pytz import timezone, utc, all_timezones
 from tzlocal import get_localzone
 import click
 from pprint import pprint
+from dateutil.rrule import rrulestr, rruleset
 
 def org_datetime(dt, tz):
     '''Timezone aware datetime to YYYY-MM-DD DayofWeek HH:MM str in localtime.
@@ -66,16 +67,10 @@ def generate_events(comp, timeframe_start, timeframe_end, tz, emails):
     # Note: timeframe_start and timeframe_end are in UTC
     if comp.name != 'VEVENT':
         return []
+
     if 'RRULE' in comp:
-        return {
-            'WEEKLY':
-            DailyEvents(7, comp, timeframe_start, timeframe_end, tz, emails),
-            'DAILY':
-            DailyEvents(1, comp, timeframe_start, timeframe_end, tz, emails),
-            'MONTHLY': [],
-            'YEARLY':
-            YearlyEvents(comp, timeframe_start, timeframe_end, tz, emails)
-        }[comp['RRULE']['FREQ'][0]]
+        return RecurringEvent(comp, timeframe_start, timeframe_end, tz)
+
     return SingleEvent(comp, timeframe_start, timeframe_end, tz, emails)
 
 def filter_events(events, comp, tz, emails):
@@ -105,6 +100,49 @@ def filter_events(events, comp, tz, emails):
         filtered_events.append(ev)
     return filtered_events
 
+class RecurringEvent():
+    '''Iterator for recurring events.'''
+
+    def __init__(self, comp, timeframe_start, timeframe_end, tz):
+        self.ev_start = get_datetime(comp['DTSTART'].dt, tz)
+        if "DTEND" not in comp:
+            self.ev_end = self.ev_start
+        else:
+            self.ev_end = get_datetime(comp['DTEND'].dt, tz)
+        self.duration = self.ev_end - self.ev_start
+
+        try:
+            self.recurrences = rrulestr(comp['RRULE'].to_ical().decode('utf-8'), dtstart=self.ev_start)
+        except:
+            print('Could not decode RRULE: ' + comp['RRULE'].to_ical().decode('utf-8'))
+            self.recurrences = []
+        self.rules = rruleset()
+        self.rules.rrule(self.recurrences)
+
+        self.exclude = set()
+        if 'EXDATE' in comp:
+            exdate = comp['EXDATE']
+            if isinstance(exdate, list):
+                exdate = itertools.chain.from_iterable([e.dts for e in exdate])
+            else:
+                exdate = exdate.dts
+            self.exclude = set([get_datetime(dt.dt, tz) for dt in exdate])
+
+            for skip in self.exclude:
+                self.rules.exdate(skip)
+
+        self.events = self.rules.between(timeframe_start, timeframe_end)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.events:
+            current = self.events.pop()
+            return (current,
+                    current.tzinfo.normalize(current+self.duration),1)
+        raise StopIteration
+
 class SingleEvent():
     '''Iterator for non-recurring single events.'''
 
@@ -126,129 +164,6 @@ class SingleEvent():
         if (ev_start < timeframe_end and ev_end > timeframe_start):
             self.events = [(ev_start, ev_end, 0)
                            for ev_start in filter_events([ev_start], comp, tz, emails)]
-    def __iter__(self):
-        return iter(self.events)
-
-class DailyEvents():
-    '''Class for daily-based recurring events (daily, weekly).'''
-
-    def populate(self, timeframe_start, timeframe_end):
-        '''Populate all events that fall into timeframe.'''
-        if self.until_utc < timeframe_start:
-            return []
-        self.until_utc = min(self.until_utc, timeframe_end)
-        if self.ev_start < timeframe_start:
-            # advance to timeframe start
-            (current, counts) = advance_just_before(
-                self.ev_start, timeframe_start, self.delta_days)
-            if self.is_count:
-                self.count -= counts
-                if self.count < 1:
-                    return []
-            while current < timeframe_start:
-                current = add_delta_dst(current, self.delta)
-        else:
-            current = self.ev_start
-        events = []
-        while current <= self.until_utc:
-            events.append(current)
-            current = add_delta_dst(current, self.delta)
-            if self.is_count:
-                self.count -= 1
-                if self.count < 1:
-                    break
-        return events
-
-    def __init__(self, days, comp, timeframe_start, timeframe_end, tz, emails):
-        uid = comp.get('UID', '**NOID**')
-        self.events = list()
-        self.ev_start = get_datetime(comp['DTSTART'].dt, tz)
-        if "DTEND" not in comp:
-            self.ev_end = self.ev_start
-        else:
-            self.ev_end = get_datetime(comp['DTEND'].dt, tz)
-        self.duration = self.ev_end - self.ev_start
-        self.is_count = False
-        if 'COUNT' in comp['RRULE']:
-            self.is_count = True
-            self.count = comp['RRULE']['COUNT'][0]
-        self.delta_days = days
-        if 'INTERVAL' in comp['RRULE']:
-            self.delta_days *= comp['RRULE']['INTERVAL'][0]
-        self.delta = timedelta(self.delta_days)
-        if 'UNTIL' in comp['RRULE']:
-            if self.is_count:
-                msg = "Event UID {}: UNTIL and COUNT MUST NOT occur in the same 'recur'".format(uid)
-                raise ValueError(msg)
-            self.until_utc = get_datetime(comp['RRULE']['UNTIL'][0],
-                                          tz).astimezone(utc)
-        else:
-            self.until_utc = timeframe_end
-        if self.until_utc < timeframe_start:
-            return
-        self.until_utc = min(self.until_utc, timeframe_end)
-        events = self.populate(timeframe_start, timeframe_end)
-        self.events = [(event, event.tzinfo.normalize(event + self.duration), 1)
-                       for event in filter_events(events, comp, tz, emails)]
-
-    def __iter__(self):
-        return iter(self.events)
-
-class MonthlyEvents():
-    '''TODO: Class for monthly recurring events.'''
-    pass
-
-class YearlyEvents():
-    '''Class for yearly recurring events.'''
-
-    def __init__(self, comp, timeframe_start, timeframe_end, tz, emails):
-        uid = comp.get('UID', '**NOID**')
-        ev_start = get_datetime(comp['DTSTART'].dt, tz)
-        if "DTEND" not in comp:
-            ev_end = ev_start
-        else:
-            ev_end = get_datetime(comp['DTEND'].dt, tz)
-        start = timeframe_start
-        end = timeframe_end
-        is_until = False
-        if 'UNTIL' in comp['RRULE']:
-            is_until = True
-            end = min(end,
-                      get_datetime(comp['RRULE']['UNTIL'][0],
-                                   tz).astimezone(utc))
-        if end < start:
-            self.events = []
-            return
-        if 'BYMONTH' in comp['RRULE']:
-            bymonth = comp['RRULE']['BYMONTH'][0]
-        else:
-            bymonth = ev_start.month
-        if 'BYMONTHDAY' in comp['RRULE']:
-            bymonthday = comp['RRULE']['BYMONTHDAY'][0]
-        else:
-            bymonthday = ev_start.day
-        duration = ev_end - ev_start
-        # populate
-        years = list(range(start.year, end.year + 1))
-        if 'COUNT' in comp['RRULE']:
-            if is_until:
-                msg = "Event UID {}: UNTIL and COUNT MUST NOT occur in the same 'recur'".format(uid)
-                raise ValueError(msg)
-            years = list(range(ev_start.year, end.year + 1))
-            del years[comp['RRULE']['COUNT'][0]:]
-        events = []
-        for year in years:
-            event = ev_start.replace(year=year)
-            event = event.replace(month=bymonth)
-            event = event.replace(day=bymonthday)
-            if event > end:
-                break
-            if event < start:
-                continue
-            events.append(event)
-        self.events = [(event, event.tzinfo.normalize(event + duration), 1)
-                       for event in filter_events(events, comp, tz, emails)]
-
     def __iter__(self):
         return iter(self.events)
 
